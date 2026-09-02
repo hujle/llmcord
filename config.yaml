@@ -12,6 +12,16 @@ max_messages: 25
 use_plain_responses: false
 allow_dms: true
 
+auto_respond:
+  enabled: false
+  min_minutes: 10
+  max_minutes: 60
+  history_depth: 50
+  # When true, monitor channels listed in permissions.channels.allowed_ids.
+  # When false, monitor the channel IDs listed below.
+  use_allowed_channels: true
+  channel_ids: []
+
 permissions:
   users:
     admin_ids: []

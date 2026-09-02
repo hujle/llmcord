@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import os
+import random
 from typing import Any, Literal, Optional
 
 import discord
@@ -110,15 +111,123 @@ async def on_ready() -> None:
 
     await discord_bot.tree.sync()
 
+    if config.get("auto_respond", {}).get("enabled", False):
+        discord_bot.loop.create_task(auto_respond_loop())
+
+
+def is_auto_respond_channel(channel: discord.abc.Messageable, channel_ids: set[int]) -> bool:
+    if not isinstance(channel, discord.TextChannel):
+        return False
+    return channel.id in channel_ids or channel.parent_id in channel_ids or channel.category_id in channel_ids
+
+
+async def auto_respond_loop() -> None:
+    while not discord_bot.is_closed():
+        config = await asyncio.to_thread(get_config)
+        auto_config = config.get("auto_respond", {})
+
+        if not auto_config.get("enabled", False):
+            await asyncio.sleep(60)
+            continue
+
+        min_minutes = auto_config.get("min_minutes", 10)
+        max_minutes = auto_config.get("max_minutes", 60)
+        min_seconds = min(min_minutes, max_minutes) * 60
+        max_seconds = max(min_minutes, max_minutes) * 60
+        sleep_seconds = random.randint(min_seconds, max_seconds)
+
+        logging.info(f"Auto-respond: sleeping for {sleep_seconds / 60:.1f} minutes")
+        await asyncio.sleep(sleep_seconds)
+
+        if discord_bot.is_closed():
+            return
+
+        config = await asyncio.to_thread(get_config)
+        auto_config = config.get("auto_respond", {})
+        if not auto_config.get("enabled", False):
+            continue
+
+        permissions = config["permissions"]
+        allowed_channel_ids = set(permissions["channels"]["allowed_ids"])
+        blocked_channel_ids = set(permissions["channels"]["blocked_ids"])
+
+        channels_to_monitor = allowed_channel_ids if allowed_channel_ids else set()
+        if auto_config.get("use_allowed_channels", True):
+            channel_ids = channels_to_monitor - blocked_channel_ids
+        else:
+            channel_ids = set(auto_config.get("channel_ids", [])) - blocked_channel_ids
+
+        if not channel_ids:
+            logging.warning("Auto-respond enabled but no channels configured to monitor")
+            continue
+
+        chosen_channel = None
+        candidate_messages = []
+
+        for channel_id in channel_ids:
+            channel = discord_bot.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                history_depth = auto_config.get("history_depth", 50)
+                messages = [m async for m in channel.history(limit=history_depth) if m.author != discord_bot.user and not m.author.bot and m.content.strip()]
+                if messages:
+                    candidate_messages.extend(messages)
+            except Exception:
+                logging.exception(f"Error fetching history for channel {channel_id}")
+                continue
+
+        if not candidate_messages:
+            logging.info("Auto-respond: no candidate messages found")
+            continue
+
+        chosen_message = random.choice(candidate_messages)
+        chosen_channel = chosen_message.channel
+
+        # Treat the chosen message as if it mentioned the bot so process_message will reply.
+        class _AutoRespondMessageProxy:
+            def __init__(self, original: discord.Message, fake_content: str) -> None:
+                self._original = original
+                self._fake_content = fake_content
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._original, name)
+
+            @property
+            def content(self) -> str:
+                return self._fake_content
+
+            @property
+            def mentions(self):
+                return [discord_bot.user]
+
+        fake_content = f"{discord_bot.user.mention} {chosen_message.content}"
+        proxy_msg = _AutoRespondMessageProxy(chosen_message, fake_content)
+        logging.info(f"Auto-respond: responding to message {chosen_message.id} in channel {chosen_channel.id}")
+        await process_message(proxy_msg)
+
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time
+    if not await should_respond_to_message(new_msg):
+        return
 
+    await process_message(new_msg)
+
+
+async def should_respond_to_message(new_msg: discord.Message) -> bool:
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
     if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
-        return
+        return False
+
+    return True
+
+
+async def process_message(new_msg: discord.Message) -> None:
+    global last_task_time
+
+    is_dm = new_msg.channel.type == discord.ChannelType.private
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
